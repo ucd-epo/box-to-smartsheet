@@ -1,0 +1,14 @@
+{
+  "name": "box-to-smartsheet",
+  "version": "1.0.0",
+  "description": "Downloads files from a Box folder and attaches each to the matching Smartsheet row.",
+  "private": true,
+  "type": "module",
+  "main": "BoxToSmartsheet.mjs",
+  "scripts": {
+    "start": "node BoxToSmartsheet.mjs"
+  },
+  "engines": {
+    "node": ">=20.12"
+  }
+}
