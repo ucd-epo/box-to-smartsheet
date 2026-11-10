@@ -1,4 +1,4 @@
-# Runs BoxToSmartsheet.mjs on a schedule in GitHub Actions.
+# Runs voxToSmartsheet.mjs on a schedule in GitHub Actions.
 #
 # There is no .env here. Settings come from the repo's
 # Settings > Secrets and variables > Actions page:
@@ -36,7 +36,7 @@ jobs:
           node-version: 22
 
       - name: Copy Box files to Smartsheet
-        run: node BoxToSmartsheet.mjs
+        run: node boxToSmartsheet.mjs
         env:
           BOX_AUTH_MODE: ccg
           BOX_CLIENT_ID: ${{ secrets.BOX_CLIENT_ID }}

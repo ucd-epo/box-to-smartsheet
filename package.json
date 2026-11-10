@@ -4,9 +4,9 @@
   "description": "Downloads files from a Box folder and attaches each to the matching Smartsheet row.",
   "private": true,
   "type": "module",
-  "main": "BoxToSmartsheet.mjs",
+  "main": "boxToSmartsheet.mjs",
   "scripts": {
-    "start": "node BoxToSmartsheet.mjs"
+    "start": "node boxToSmartsheet.mjs"
   },
   "engines": {
     "node": ">=20.12"

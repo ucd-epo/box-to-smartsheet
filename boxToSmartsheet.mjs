@@ -1,23 +1,38 @@
 // BoxToSmartsheet.mjs
 //
-// Downloads every file in a Box folder and attaches each one to the
-// Smartsheet row whose key column matches the file name (minus extension).
-// Example: "INC12345.pdf" is attached to the row where Key Column = "INC12345".
+// For every file in a Box folder:
+//   1. Adds a new row to a Smartsheet sheet with the document name (file name
+//      without its extension) in the name column.
+//   2. Downloads the file from Box and attaches it to that new row.
+//
+// Safe to rerun: if a row with that document name already has the file attached,
+// it is skipped. If the row exists but the file isn't attached (e.g., a previous
+// run failed partway), the file is attached to that existing row instead of
+// creating a duplicate.
 //
 // Requires Node 20.12+ (built-in fetch and .env loading). No npm packages needed.
 //
 // All settings live in a .env file next to this script. Copy .env.example
 // to .env and fill it in. Never commit .env.
 //
-// Run:  node BoxToSmartsheet.mjs
+// Box auth: set BOX_CLIENT_ID / BOX_CLIENT_SECRET / BOX_SUBJECT_ID for unattended
+// runs (Client Credentials Grant), or BOX_TOKEN for a quick test with a developer token.
+//
+// Run:  node boxToSmartsheet.mjs
 
 loadEnv();
 
-const BOX_TOKEN = requireEnv('BOX_TOKEN');
+const BOX_TOKEN = await getBoxToken();
 const SS_TOKEN = requireEnv('SMARTSHEET_TOKEN');
 const BOX_FOLDER_ID = requireEnv('BOX_FOLDER_ID');
 const SHEET_ID = requireEnv('SHEET_ID');
-const KEY_COLUMN_TITLE = requireEnv('KEY_COLUMN_TITLE');
+// NAME_COLUMN_TITLE is the column that receives the document name.
+// KEY_COLUMN_TITLE is still accepted so older .env files keep working.
+const NAME_COLUMN_TITLE = (process.env.NAME_COLUMN_TITLE || process.env.KEY_COLUMN_TITLE || '').trim();
+if (!NAME_COLUMN_TITLE) {
+  console.error('Missing environment variable: NAME_COLUMN_TITLE');
+  process.exit(1);
+}
 // Dry run stays on unless explicitly set to "false", so a missing setting never uploads by accident.
 const DRY_RUN = (process.env.DRY_RUN ?? 'true').trim().toLowerCase() !== 'false';
 
@@ -41,41 +56,53 @@ const CONTENT_TYPES = {
 };
 
 async function main() {
-  const rowsByKey = await buildRowLookup();
-  console.log(`Loaded ${rowsByKey.size} rows with a key value.`);
+  const { nameColumnId, rowsByName } = await loadSheet();
+  console.log(`Sheet has ${rowsByName.size} rows with a value in "${NAME_COLUMN_TITLE}".`);
 
   const existing = await getExistingRowAttachments();
   const files = await listBoxFiles(BOX_FOLDER_ID);
   console.log(`Found ${files.length} files in the Box folder.`);
 
-  let attached = 0, skipped = 0, unmatched = 0, failed = 0;
+  let created = 0, attachedExisting = 0, skipped = 0, failed = 0;
 
   for (const file of files) {
-    const key = stripExtension(file.name).trim();
-    const rowId = rowsByKey.get(key);
+    const docName = stripExtension(file.name).trim();
+    const existingRowId = rowsByName.get(docName);
 
-    if (!rowId) {
-      console.log(`NO MATCH: ${file.name}`);
-      unmatched++;
-      continue;
-    }
-
-    if (existing.has(`${rowId}|${file.name}`)) {
-      console.log(`ALREADY ATTACHED, skipping: ${file.name}`);
+    if (existingRowId && existing.has(`${existingRowId}|${file.name}`)) {
+      console.log(`ALREADY DONE, skipping: ${file.name}`);
       skipped++;
       continue;
     }
 
     if (DRY_RUN) {
-      console.log(`WOULD ATTACH: ${file.name} -> row ${rowId}`);
+      console.log(existingRowId
+        ? `WOULD ATTACH to existing row: ${file.name} -> "${docName}"`
+        : `WOULD ADD ROW + ATTACH: "${docName}" <- ${file.name}`);
       continue;
     }
 
     try {
-      const data = await downloadBoxFile(file.id);   // 1. download from Box (in memory)
-      await attachToRow(rowId, file.name, data);     // 2. upload to the Smartsheet row
-      console.log(`ATTACHED: ${file.name} -> row ${rowId}`);
-      attached++;
+      // 1. Download from Box first, so a failed download doesn't leave an empty row.
+      const data = await downloadBoxFile(file.id);
+
+      // 2. Use the existing row if there is one, otherwise add a new row.
+      let rowId = existingRowId;
+      if (!rowId) {
+        rowId = await addRow(nameColumnId, docName);
+        rowsByName.set(docName, rowId);
+      }
+
+      // 3. Attach the file to the row.
+      await attachToRow(rowId, file.name, data);
+
+      if (existingRowId) {
+        console.log(`ATTACHED to existing row: ${file.name}`);
+        attachedExisting++;
+      } else {
+        console.log(`ADDED ROW + ATTACHED: ${file.name}`);
+        created++;
+      }
       await sleep(250); // stay well under Smartsheet's rate limit
     } catch (err) {
       console.error(`FAILED: ${file.name} - ${err.message}`);
@@ -84,34 +111,47 @@ async function main() {
   }
 
   console.log(
-    `Done${DRY_RUN ? ' (dry run)' : ''}. Attached: ${attached}, Already there: ${skipped}, ` +
-    `No match: ${unmatched}, Failed: ${failed}`
+    `Done${DRY_RUN ? ' (dry run, nothing changed)' : ''}. New rows: ${created}, ` +
+    `Attached to existing rows: ${attachedExisting}, Already done: ${skipped}, Failed: ${failed}`
   );
 }
 
 // ---------- Smartsheet ----------
 
-// Maps each key-column value to its row ID.
-async function buildRowLookup() {
+// Finds the name column and maps each existing name to its row ID.
+async function loadSheet() {
   const sheet = await ssRequest(`/sheets/${SHEET_ID}`);
 
-  const keyColumn = sheet.columns.find(c => c.title === KEY_COLUMN_TITLE);
-  if (!keyColumn) throw new Error(`Column not found: ${KEY_COLUMN_TITLE}`);
+  const nameColumn = sheet.columns.find(c => c.title === NAME_COLUMN_TITLE);
+  if (!nameColumn) {
+    const titles = sheet.columns.map(c => `"${c.title}"`).join(', ');
+    throw new Error(`Column not found: "${NAME_COLUMN_TITLE}". Columns in this sheet: ${titles}`);
+  }
 
-  const map = new Map();
-  for (const row of sheet.rows) {
-    const cell = row.cells.find(c => c.columnId === keyColumn.id);
+  const rowsByName = new Map();
+  for (const row of sheet.rows ?? []) {
+    const cell = row.cells.find(c => c.columnId === nameColumn.id);
     const value = cell?.displayValue ?? cell?.value;
     if (value == null || value === '') continue;
 
-    const key = String(value).trim();
-    if (map.has(key)) {
-      console.log(`WARNING: duplicate key '${key}', using first row.`);
-    } else {
-      map.set(key, row.id);
-    }
+    const name = String(value).trim();
+    if (!rowsByName.has(name)) rowsByName.set(name, row.id);
   }
-  return map;
+  return { nameColumnId: nameColumn.id, rowsByName };
+}
+
+// Adds a row at the bottom of the sheet with the document name, returns its row ID.
+async function addRow(nameColumnId, docName) {
+  const result = await ssRequest(`/sheets/${SHEET_ID}/rows`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify([
+      { toBottom: true, cells: [{ columnId: nameColumnId, value: docName }] },
+    ]),
+  });
+  const row = Array.isArray(result.result) ? result.result[0] : result.result;
+  if (!row?.id) throw new Error('Row was not created (no row ID returned).');
+  return row.id;
 }
 
 // Set of "rowId|fileName" for attachments already on rows, so reruns don't duplicate.
@@ -154,6 +194,41 @@ async function ssRequest(path, options = {}, attempt = 1) {
     throw new Error(`Smartsheet ${res.status}: ${await res.text()}`);
   }
   return res.json();
+}
+
+// ---------- Box auth ----------
+
+// Uses Client Credentials Grant (server auth) when BOX_CLIENT_ID and BOX_CLIENT_SECRET
+// are set, fetching a fresh token on every run. Otherwise falls back to BOX_TOKEN
+// (e.g., a 60-minute developer token for testing).
+async function getBoxToken() {
+  const clientId = process.env.BOX_CLIENT_ID?.trim();
+  const clientSecret = process.env.BOX_CLIENT_SECRET?.trim();
+
+  if (!clientId || !clientSecret) {
+    return requireEnv('BOX_TOKEN');
+  }
+
+  const subjectType = (process.env.BOX_SUBJECT_TYPE ?? 'enterprise').trim();
+  const subjectId = requireEnv('BOX_SUBJECT_ID');
+
+  const res = await fetch('https://api.box.com/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+      box_subject_type: subjectType,
+      box_subject_id: subjectId,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Box token request failed (${res.status}): ${await res.text()}`);
+  }
+  const data = await res.json();
+  return data.access_token;
 }
 
 // ---------- Box ----------
@@ -230,3 +305,4 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
+
