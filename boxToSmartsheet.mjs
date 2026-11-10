@@ -1,4 +1,4 @@
-// BoxToSmartsheet.mjs
+// boxToSmartsheet.mjs
 //
 // For every file in a Box folder:
 //   1. Adds a new row to a Smartsheet sheet with the document name (file name
@@ -15,14 +15,24 @@
 // All settings live in a .env file next to this script. Copy .env.example
 // to .env and fill it in. Never commit .env.
 //
-// Box auth: set BOX_CLIENT_ID / BOX_CLIENT_SECRET / BOX_SUBJECT_ID for unattended
-// runs (Client Credentials Grant), or BOX_TOKEN for a quick test with a developer token.
+// Box auth is handled in boxAuth.mjs. For scheduled runs, set BOX_AUTH_MODE=oauth
+// and run `npm run authorize` once; the script renews its own token after that.
 //
 // Run:  node boxToSmartsheet.mjs
 
+import { loadEnv, requireEnv, getBoxToken, authMode } from './boxAuth.mjs';
+
 loadEnv();
 
-const BOX_TOKEN = await getBoxToken();
+console.log(`Run started ${new Date().toISOString()} (Box auth: ${authMode()})`);
+
+let boxToken;
+try {
+  boxToken = await getBoxToken();
+} catch (err) {
+  console.error(`Box sign-in problem: ${err.message}`);
+  process.exit(1);
+}
 const SS_TOKEN = requireEnv('SMARTSHEET_TOKEN');
 const BOX_FOLDER_ID = requireEnv('BOX_FOLDER_ID');
 const SHEET_ID = requireEnv('SHEET_ID');
@@ -196,41 +206,6 @@ async function ssRequest(path, options = {}, attempt = 1) {
   return res.json();
 }
 
-// ---------- Box auth ----------
-
-// Uses Client Credentials Grant (server auth) when BOX_CLIENT_ID and BOX_CLIENT_SECRET
-// are set, fetching a fresh token on every run. Otherwise falls back to BOX_TOKEN
-// (e.g., a 60-minute developer token for testing).
-async function getBoxToken() {
-  const clientId = process.env.BOX_CLIENT_ID?.trim();
-  const clientSecret = process.env.BOX_CLIENT_SECRET?.trim();
-
-  if (!clientId || !clientSecret) {
-    return requireEnv('BOX_TOKEN');
-  }
-
-  const subjectType = (process.env.BOX_SUBJECT_TYPE ?? 'enterprise').trim();
-  const subjectId = requireEnv('BOX_SUBJECT_ID');
-
-  const res = await fetch('https://api.box.com/oauth2/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: clientId,
-      client_secret: clientSecret,
-      box_subject_type: subjectType,
-      box_subject_id: subjectId,
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Box token request failed (${res.status}): ${await res.text()}`);
-  }
-  const data = await res.json();
-  return data.access_token;
-}
-
 // ---------- Box ----------
 
 // Lists all files (not subfolders or web links) in a folder, handling pagination.
@@ -240,9 +215,8 @@ async function listBoxFiles(folderId) {
   let offset = 0;
 
   while (true) {
-    const res = await fetch(
-      `${BOX_API}/folders/${folderId}/items?fields=id,name,type&limit=${limit}&offset=${offset}`,
-      { headers: { Authorization: `Bearer ${BOX_TOKEN}` } }
+    const res = await boxFetch(
+      `${BOX_API}/folders/${folderId}/items?fields=id,name,type&limit=${limit}&offset=${offset}`
     );
     if (!res.ok) throw new Error(`Box ${res.status}: ${await res.text()}`);
 
@@ -255,11 +229,19 @@ async function listBoxFiles(folderId) {
   return files;
 }
 
+// GET from Box. If the token expires mid-run (401), renew it once and retry.
+async function boxFetch(url, retried = false) {
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${boxToken}` } });
+  if (res.status === 401 && !retried && authMode() !== 'token') {
+    boxToken = await getBoxToken({ forceRefresh: true });
+    return boxFetch(url, true);
+  }
+  return res;
+}
+
 async function downloadBoxFile(fileId) {
   // Box responds with a redirect to the download URL; fetch follows it automatically.
-  const res = await fetch(`${BOX_API}/files/${fileId}/content`, {
-    headers: { Authorization: `Bearer ${BOX_TOKEN}` },
-  });
+  const res = await boxFetch(`${BOX_API}/files/${fileId}/content`);
   if (!res.ok) throw new Error(`Box download ${res.status}: ${await res.text()}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -271,32 +253,6 @@ function stripExtension(name) {
   return dot > 0 ? name.slice(0, dot) : name;
 }
 
-// Loads .env from the current folder using Node's built-in loader.
-function loadEnv() {
-  if (typeof process.loadEnvFile !== 'function') {
-    console.error('This Node version cannot load .env files. Update to Node 20.12 or newer.');
-    process.exit(1);
-  }
-  try {
-    process.loadEnvFile('.env');
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      console.error('No .env file found. Copy .env.example to .env and fill it in.');
-      process.exit(1);
-    }
-    throw err;
-  }
-}
-
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v || !v.trim()) {
-    console.error(`Missing environment variable: ${name}`);
-    process.exit(1);
-  }
-  return v;
-}
-
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -305,4 +261,3 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
-
