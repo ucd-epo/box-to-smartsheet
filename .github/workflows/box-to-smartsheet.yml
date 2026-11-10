@@ -1,0 +1,51 @@
+# Runs BoxToSmartsheet.mjs on a schedule in GitHub Actions.
+#
+# There is no .env here. Settings come from the repo's
+# Settings > Secrets and variables > Actions page:
+#   Secrets:   BOX_CLIENT_ID, BOX_CLIENT_SECRET, BOX_SUBJECT_ID, SMARTSHEET_TOKEN
+#   Variables: BOX_SUBJECT_TYPE, SHEET_ID, BOX_FOLDER_ID, NAME_COLUMN_TITLE, DRY_RUN
+#
+# Box auth must be ccg (an admin-approved Client Credentials Grant app).
+
+name: Box to Smartsheet
+
+on:
+  schedule:
+    # Cron times are UTC. 14:47 UTC = 6:47 AM Pacific in winter, 7:47 AM in summer.
+    # Weekdays only (1-5). GitHub may start scheduled runs a few minutes late.
+    - cron: '47 14 * * 1-5'
+  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
+
+# Never run two copies at once.
+concurrency:
+  group: box-to-smartsheet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Copy Box files to Smartsheet
+        run: node BoxToSmartsheet.mjs
+        env:
+          BOX_AUTH_MODE: ccg
+          BOX_CLIENT_ID: ${{ secrets.BOX_CLIENT_ID }}
+          BOX_CLIENT_SECRET: ${{ secrets.BOX_CLIENT_SECRET }}
+          BOX_SUBJECT_ID: ${{ secrets.BOX_SUBJECT_ID }}
+          BOX_SUBJECT_TYPE: ${{ vars.BOX_SUBJECT_TYPE || 'enterprise' }}
+          SMARTSHEET_TOKEN: ${{ secrets.SMARTSHEET_TOKEN }}
+          SHEET_ID: ${{ vars.SHEET_ID }}
+          BOX_FOLDER_ID: ${{ vars.BOX_FOLDER_ID }}
+          NAME_COLUMN_TITLE: ${{ vars.NAME_COLUMN_TITLE }}
+          # Stays a dry run until you set the DRY_RUN variable to false.
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
